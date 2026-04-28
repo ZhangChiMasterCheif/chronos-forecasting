@@ -242,11 +242,22 @@ def plot_intervals_for_state(
             base_lo[j:j+1], base_hi[j:j+1], Q_hat_j
         )
 
-    # PID: run online for this single state, warm-started with the 50-state Q_hat
+    # PID: run online for this single state, warm-started the same way as
+    # method_pid.run_pid in the main experiment (warmstart_alpha on cal residuals)
+    cal_tensors_for_pid = to_tensor_list(test_wide.iloc[0:0])  # placeholder
+    # we need cal_tensors derived from cal_wide; reconstruct it
+    # simpler: use the cal context windows directly to compute residuals
+    cal_samples_pid = method_pid.get_samples_batched(
+        pipeline, cal_ctx_all, PRED_LEN, method_pid.NUM_SAMPLES, method_pid.BATCH_SIZE
+    )
+    cal_median_pid = np.median(cal_samples_pid, axis=1)                       # (N_cal, pred_len)
+    cal_errors_pid = np.abs(cal_fut_all.numpy() - cal_median_pid).max(axis=1)  # (N_cal,)
+    q0_pid         = float(np.quantile(cal_errors_pid, 1 - alpha))
+
     full_series    = torch.tensor(wide[state].values.astype("float32"))
     test_start_idx = len(wide) - len(test_wide)
     pid_lo, pid_hi, _ = method_pid.run_pid_one_state(
-        pipeline, full_series, test_start_idx, alpha, q0=Q_hat
+        pipeline, full_series, test_start_idx, alpha, q0=q0_pid
     )
 
     method_intervals = [
