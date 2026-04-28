@@ -373,9 +373,8 @@ def main(plots_only=False):
     plot_calibration_curve(df)
     plot_width_vs_alpha(df)
 
-    if not plots_only:
-        for state in EXAMPLE_STATES:
-            plot_intervals_for_state(pipeline, wide, test_wide, state, alpha=0.10)
+    for state in EXAMPLE_STATES:
+        plot_intervals_for_state(pipeline, wide, test_wide, state, alpha=0.10)
 
 
 if __name__ == "__main__":
