@@ -1,30 +1,38 @@
 """
-Unified evaluation: runs all four methods and produces comparison tables and plots.
+Unified evaluation: runs all methods and produces comparison tables and plots.
+
+Results are saved incrementally to results_table.csv after each (method, alpha)
+pair completes. Re-running skips any combination already in the CSV.
 
 Outputs
 -------
   results_table.csv       — coverage and width for every method × alpha
   calibration_curve.png   — coverage vs nominal level for all methods
   width_vs_alpha.png      — interval width vs alpha for all methods
-  intervals_<state>.png   — prediction intervals over time for a few example states
+  intervals_<state>.png   — prediction intervals over time for example states
+
+Usage
+-----
+    python evaluate.py              # run everything, skip already-done
+    python evaluate.py --plots-only # skip all experiments, just redo plots
 """
 
+import argparse
+import os
 import numpy as np
 import torch
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import pandas as pd
 from chronos import BaseChronosPipeline
 
-from covid_dataset import (
-    load_hosp_wide,
-    split_wide,
-    to_tensor_list,
-    make_all_windows,
-)
+from covid_dataset import load_hosp_wide, split_wide, to_tensor_list, make_all_windows
 import method_naive
 import method_cqr
 import method_embed_cqr
+import method_pid
 
 # ---------------------------------------------------------------------------
 # Config
@@ -38,269 +46,325 @@ NUM_SAMPLES = 100
 BATCH_SIZE  = 32
 ALPHAS      = [0.05, 0.10, 0.20, 0.30, 0.40]
 
-EXAMPLE_STATES = ["New York", "California", "Texas", "Florida"]   # for interval plots
+EXAMPLE_STATES = ["New York", "California", "Texas", "Florida"]
+RESULTS_CSV    = "results_table.csv"
+
+ALL_METHODS = ["Naive", "CQR", "Embed-CQR", "PID"]
 
 
 # ---------------------------------------------------------------------------
-# Run all methods
+# Incremental CSV helpers
 # ---------------------------------------------------------------------------
 
-def run_all(pipeline, cal_ctx, cal_fut, test_ctx, test_fut, cal_embs, test_embs, alpha):
-    """
-    Run all four methods for a given alpha. Returns a dict of results.
-    Each result has keys: lo (N, pred_len), hi (N, pred_len).
-    """
-    results = {}
+def load_existing_results() -> pd.DataFrame:
+    if os.path.exists(RESULTS_CSV):
+        return pd.read_csv(RESULTS_CSV)
+    return pd.DataFrame(columns=["method", "alpha", "nominal", "coverage", "width"])
 
-    # --- Naive ---
+
+def already_done(df_existing: pd.DataFrame, method: str, alpha: float) -> bool:
+    if df_existing.empty:
+        return False
+    return ((df_existing["method"] == method) & (df_existing["alpha"] == alpha)).any()
+
+
+def append_result(method: str, alpha: float, coverage: float, width: float):
+    row = pd.DataFrame([{
+        "method":   method,
+        "alpha":    alpha,
+        "nominal":  round(1 - alpha, 2),
+        "coverage": round(coverage, 4),
+        "width":    round(width, 2),
+    }])
+    write_header = not os.path.exists(RESULTS_CSV)
+    row.to_csv(RESULTS_CSV, mode="a", header=write_header, index=False)
+
+
+def metrics_from_arrays(lo: np.ndarray, hi: np.ndarray, futures: np.ndarray) -> dict:
+    covered = (futures >= lo) & (futures <= hi)
+    return {
+        "coverage":           float(covered.mean()),
+        "width":              float((hi - lo).mean()),
+        "coverage_per_step":  covered.mean(axis=0),
+        "width_per_step":     (hi - lo).mean(axis=0),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Run one (method, alpha) and return (lo, hi, futures_np)
+# ---------------------------------------------------------------------------
+
+def run_naive(pipeline, test_ctx, test_fut, alpha):
     lo, hi = method_naive.predict_intervals(
         pipeline, test_ctx, PRED_LEN, alpha, NUM_SAMPLES, BATCH_SIZE
     )
-    results["Naive"] = {"lo": lo, "hi": hi}
+    return lo, hi, test_fut.numpy()
 
-    # --- CQR ---
+
+def run_cqr(pipeline, cal_ctx, cal_fut, test_ctx, test_fut, alpha):
     cal_lo, cal_hi   = method_cqr.get_quantiles(pipeline, cal_ctx, PRED_LEN, alpha)
     scores           = method_cqr.cqr_scores(cal_lo, cal_hi, cal_fut.numpy())
     Q_hat            = method_cqr.cqr_quantile(scores, alpha)
     test_lo, test_hi = method_cqr.get_quantiles(pipeline, test_ctx, PRED_LEN, alpha)
     lo, hi           = method_cqr.apply_correction(test_lo, test_hi, Q_hat)
-    results["CQR"]   = {"lo": lo, "hi": hi, "Q_hat": Q_hat}
+    return lo, hi, test_fut.numpy()
 
-    # --- Embedding-CQR ---
-    gamma  = method_embed_cqr.median_heuristic_gamma(cal_embs)
+
+def run_embed_cqr(pipeline, cal_ctx, cal_fut, test_ctx, test_fut,
+                  cal_embs, test_embs, alpha):
+    gamma            = method_embed_cqr.median_heuristic_gamma(cal_embs)
+    cal_lo, cal_hi   = method_cqr.get_quantiles(pipeline, cal_ctx, PRED_LEN, alpha)
+    scores           = method_cqr.cqr_scores(cal_lo, cal_hi, cal_fut.numpy())
+    test_lo, test_hi = method_cqr.get_quantiles(pipeline, test_ctx, PRED_LEN, alpha)
+
     N_test = test_ctx.shape[0]
     lo_all = np.empty_like(test_lo)
     hi_all = np.empty_like(test_hi)
-    q_hats = np.empty(N_test)
+
     for j in range(N_test):
-        w          = method_embed_cqr.rbf_weights(test_embs[j], cal_embs, gamma)
-        q_j        = method_embed_cqr.weighted_quantile(scores, w, alpha)
+        w         = method_embed_cqr.rbf_weights(test_embs[j], cal_embs, gamma)
+        Q_hat_j   = method_embed_cqr.weighted_quantile(scores, w, alpha)
         lo_all[j], hi_all[j] = method_cqr.apply_correction(
-            test_lo[j:j+1], test_hi[j:j+1], q_j
+            test_lo[j:j+1], test_hi[j:j+1], Q_hat_j
         )
-        q_hats[j]  = q_j
-    results["Embed-CQR"] = {"lo": lo_all, "hi": hi_all, "Q_hat_mean": q_hats.mean()}
 
-    return results
+    return lo_all, hi_all, test_fut.numpy()
 
 
-# ---------------------------------------------------------------------------
-# Metrics
-# ---------------------------------------------------------------------------
-
-def summarise(results_by_alpha):
-    """
-    Build a DataFrame with coverage and width for every method × alpha.
-    results_by_alpha : { alpha: { method: { lo, hi } } }
-    """
-    rows = []
-    for alpha, method_dict in results_by_alpha.items():
-        # test futures are the same for all methods at a given alpha
-        # we need to retrieve them — they're stored in the outer scope
-        for method, res in method_dict.items():
-            lo, hi   = res["lo"], res["hi"]
-            fut      = res["futures"]
-            covered  = (fut >= lo) & (fut <= hi)
-            rows.append({
-                "method":   method,
-                "alpha":    alpha,
-                "nominal":  1 - alpha,
-                "coverage": covered.mean(),
-                "width":    (hi - lo).mean(),
-            })
-    return pd.DataFrame(rows)
+def run_pid_method(pipeline, wide, train_wide, cal_wide, alpha):
+    result = method_pid.run_pid(pipeline, wide, train_wide, cal_wide,
+                                test_wide=None, alpha=alpha)
+    # run_pid returns lo (N, pred_len) and hi (N, pred_len) over all states/windows
+    # futures are embedded inside run_pid; we need to reconstruct them for consistency
+    # Instead, use joint_coverage and width directly from run_pid's metrics
+    return result["lo"], result["hi"], result.get("futures")
 
 
 # ---------------------------------------------------------------------------
 # Plots
 # ---------------------------------------------------------------------------
 
-def plot_calibration_curve(df, out_path="calibration_curve.png"):
-    """
-    Coverage vs nominal level for each method.
-    A perfectly calibrated method lies on the diagonal.
-    """
+def plot_calibration_curve(df: pd.DataFrame):
     fig, ax = plt.subplots(figsize=(6, 6))
-    ax.plot([0, 1], [0, 1], "k--", lw=1, label="Perfect calibration")
+    ax.plot([0.5, 1.0], [0.5, 1.0], "k--", lw=1, label="Perfect calibration")
 
-    for method, grp in df.groupby("method"):
+    for method in ALL_METHODS:
+        grp = df[df["method"] == method].sort_values("nominal")
+        if grp.empty:
+            continue
         ax.plot(grp["nominal"], grp["coverage"], marker="o", label=method)
 
     ax.set_xlabel("Nominal coverage (1 − α)")
     ax.set_ylabel("Empirical coverage")
-    ax.set_title("Calibration curve")
+    ax.set_title("Calibration curve — all methods")
     ax.legend()
-    ax.set_xlim(0.5, 1.0)
-    ax.set_ylim(0.5, 1.0)
+    ax.set_xlim(0.55, 1.02)
+    ax.set_ylim(0.55, 1.02)
     fig.tight_layout()
-    fig.savefig(out_path, dpi=150)
+    fig.savefig("calibration_curve.png", dpi=150)
     plt.close(fig)
-    print(f"Saved {out_path}")
+    print("Saved calibration_curve.png")
 
 
-def plot_width_vs_alpha(df, out_path="width_vs_alpha.png"):
-    """
-    Interval width vs alpha for each method.
-    Smaller width = more efficient intervals.
-    """
+def plot_width_vs_alpha(df: pd.DataFrame):
     fig, ax = plt.subplots(figsize=(6, 4))
-    for method, grp in df.groupby("method"):
+
+    for method in ALL_METHODS:
+        grp = df[df["method"] == method].sort_values("nominal")
+        if grp.empty:
+            continue
         ax.plot(grp["nominal"], grp["width"], marker="o", label=method)
 
     ax.set_xlabel("Nominal coverage (1 − α)")
-    ax.set_ylabel("Mean interval width (admissions / day)")
+    ax.set_ylabel("Mean interval width (admissions)")
     ax.set_title("Interval width vs nominal coverage")
     ax.legend()
     fig.tight_layout()
-    fig.savefig(out_path, dpi=150)
+    fig.savefig("width_vs_alpha.png", dpi=150)
     plt.close(fig)
-    print(f"Saved {out_path}")
+    print("Saved width_vs_alpha.png")
 
 
-def plot_intervals_for_state(
-    pipeline,
-    wide,
-    test_wide,
-    state: str,
-    alpha: float = 0.1,
-    out_path: str = None,
-):
-    """
-    For one state, plot the actual time series and prediction intervals from
-    all three offline methods side by side over the test period.
-    """
+def plot_intervals_for_state(pipeline, wide, test_wide, state: str, alpha: float = 0.10):
     if state not in test_wide.columns:
-        print(f"  State '{state}' not found, skipping.")
+        print(f"  '{state}' not found, skipping.")
         return
 
     series_test = torch.tensor(test_wide[state].values.astype("float32"))
     ctx, fut    = make_all_windows([series_test], CONTEXT_LEN, PRED_LEN, stride=PRED_LEN)
-    # non-overlapping windows so we can plot a clean timeline
     if ctx.shape[0] == 0:
         return
 
-    dates_test = test_wide.index
-    # start date of each window's future
-    window_dates = [
+    dates_test  = test_wide.index
+    n_windows   = ctx.shape[0]
+
+    # start date of each window's future block
+    window_starts = [
         dates_test[CONTEXT_LEN + i * PRED_LEN]
-        for i in range(ctx.shape[0])
+        for i in range(n_windows)
         if CONTEXT_LEN + i * PRED_LEN < len(dates_test)
     ]
-    n_windows = len(window_dates)
-    ctx  = ctx[:n_windows]
-    fut  = fut[:n_windows]
+    n_windows = len(window_starts)
+    ctx = ctx[:n_windows]
+    fut = fut[:n_windows]
+    fut_np = fut.numpy()
 
-    # Get intervals from each method
-    naive_lo, naive_hi = method_naive.predict_intervals(
-        pipeline, ctx, PRED_LEN, alpha, NUM_SAMPLES, BATCH_SIZE
-    )
-    cal_lo, cal_hi     = method_cqr.get_quantiles(pipeline, ctx, PRED_LEN, alpha)
-
-    # CQR: need calibration scores — use a quick single-state cal set
+    # quick single-state calibration for CQR correction
     cal_series = torch.tensor(
-        wide.loc[wide.index < test_wide.index[0], state].values.astype("float32")
+        wide[state].loc[wide.index < test_wide.index[0]].values[-182:].astype("float32")
     )
-    cal_ctx_s, cal_fut_s = make_all_windows([cal_series[-182:]], CONTEXT_LEN, PRED_LEN, stride=PRED_LEN)
+    cal_ctx_s, cal_fut_s = make_all_windows([cal_series], CONTEXT_LEN, PRED_LEN, stride=PRED_LEN)
     if cal_ctx_s.shape[0] > 0:
-        c_lo, c_hi = method_cqr.get_quantiles(pipeline, cal_ctx_s, PRED_LEN, alpha)
-        scores_s   = method_cqr.cqr_scores(c_lo, c_hi, cal_fut_s.numpy())
-        Q_hat_s    = method_cqr.cqr_quantile(scores_s, alpha)
+        c_lo, c_hi   = method_cqr.get_quantiles(pipeline, cal_ctx_s, PRED_LEN, alpha)
+        scores_s     = method_cqr.cqr_scores(c_lo, c_hi, cal_fut_s.numpy())
+        Q_hat_s      = method_cqr.cqr_quantile(scores_s, alpha)
     else:
         Q_hat_s = 0.0
 
-    cqr_lo, cqr_hi = method_cqr.apply_correction(cal_lo, cal_hi, Q_hat_s)
+    naive_lo, naive_hi   = method_naive.predict_intervals(pipeline, ctx, PRED_LEN, alpha)
+    base_lo, base_hi     = method_cqr.get_quantiles(pipeline, ctx, PRED_LEN, alpha)
+    cqr_lo, cqr_hi       = method_cqr.apply_correction(base_lo, base_hi, Q_hat_s)
 
-    fig, axes = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
     method_intervals = [
         ("Naive",   naive_lo, naive_hi, "steelblue"),
         ("CQR",     cqr_lo,   cqr_hi,   "darkorange"),
-        ("Embed-CQR (approx)", cqr_lo, cqr_hi, "seagreen"),  # placeholder
     ]
 
-    for ax, (name, lo, hi, color) in zip(axes, method_intervals):
-        # plot actual values
-        ax.plot(dates_test, test_wide[state].values, color="black", lw=1.0,
-                label="Observed", zorder=3)
+    fig, axes = plt.subplots(len(method_intervals), 1,
+                             figsize=(13, 4 * len(method_intervals)), sharex=True)
+    if len(method_intervals) == 1:
+        axes = [axes]
 
-        # plot each prediction window's interval as a shaded band
-        for i, d in enumerate(window_dates):
+    obs = test_wide[state].values
+
+    for ax, (name, lo, hi, color) in zip(axes, method_intervals):
+        ax.plot(dates_test, obs, color="black", lw=1.0, label="Observed", zorder=3)
+
+        for i, d in enumerate(window_starts):
             if i >= lo.shape[0]:
                 break
-            horizon_dates = pd.date_range(d, periods=PRED_LEN, freq="D")
-            ax.fill_between(horizon_dates, lo[i], hi[i],
-                            alpha=0.35, color=color)
-            ax.plot(horizon_dates, (lo[i] + hi[i]) / 2,
-                    color=color, lw=0.8, alpha=0.7)
+            h_dates = pd.date_range(d, periods=PRED_LEN, freq="D")
+            ax.fill_between(h_dates, lo[i], hi[i], alpha=0.35, color=color)
+            ax.plot(h_dates, (lo[i] + hi[i]) / 2, color=color, lw=0.8, alpha=0.7)
 
+        cov = float(((fut_np >= lo[:n_windows]) & (fut_np <= hi[:n_windows])).mean())
         ax.set_ylabel("Admissions")
-        ax.set_title(f"{name}  (nominal {1-alpha:.0%})")
+        ax.set_title(f"{name}  (nominal {1-alpha:.0%}, empirical {cov:.1%})")
         ax.legend(loc="upper right", fontsize=8)
         ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
         ax.xaxis.set_major_locator(mdates.MonthLocator(interval=2))
 
-    fig.suptitle(f"{state} — COVID hospitalisations, test period", fontsize=12)
+    fig.suptitle(f"{state} — COVID hospitalisations (test period)", fontsize=12)
     fig.autofmt_xdate()
     fig.tight_layout()
 
-    path = out_path or f"intervals_{state.replace(' ', '_')}.png"
-    fig.savefig(path, dpi=150)
+    out = f"intervals_{state.replace(' ', '_')}.png"
+    fig.savefig(out, dpi=150)
     plt.close(fig)
-    print(f"Saved {path}")
+    print(f"Saved {out}")
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
-def main():
-    print("Loading data ...")
-    wide = load_hosp_wide()
-    _, cal_wide, test_wide = split_wide(wide)
+def main(plots_only=False):
+    df_existing = load_existing_results()
 
-    cal_tensors  = to_tensor_list(cal_wide)
-    test_tensors = to_tensor_list(test_wide)
+    if not plots_only:
+        print("Loading data ...")
+        wide = load_hosp_wide()
+        train_wide, cal_wide, test_wide = split_wide(wide)
 
-    cal_ctx,  cal_fut  = make_all_windows(cal_tensors,  CONTEXT_LEN, PRED_LEN, stride=STRIDE)
-    test_ctx, test_fut = make_all_windows(test_tensors, CONTEXT_LEN, PRED_LEN, stride=STRIDE)
+        cal_tensors  = to_tensor_list(cal_wide)
+        test_tensors = to_tensor_list(test_wide)
+        cal_ctx,  cal_fut  = make_all_windows(cal_tensors,  CONTEXT_LEN, PRED_LEN, stride=STRIDE)
+        test_ctx, test_fut = make_all_windows(test_tensors, CONTEXT_LEN, PRED_LEN, stride=STRIDE)
 
-    print(f"\nLoading Chronos model: {MODEL_ID} ...")
-    pipeline = BaseChronosPipeline.from_pretrained(
-        MODEL_ID, device_map="auto", torch_dtype=torch.float32,
-    )
+        need_model = any(
+            not already_done(df_existing, m, a)
+            for m in ALL_METHODS for a in ALPHAS
+        )
 
-    print("\nComputing embeddings (needed for Embed-CQR) ...")
-    cal_embs  = method_embed_cqr.get_embeddings(pipeline, cal_ctx)
-    test_embs = method_embed_cqr.get_embeddings(pipeline, test_ctx)
+        if need_model:
+            print(f"\nLoading Chronos model: {MODEL_ID} ...")
+            pipeline = BaseChronosPipeline.from_pretrained(
+                MODEL_ID, device_map="auto", torch_dtype=torch.float32,
+            )
+        else:
+            pipeline = None
+            print("All experiments already done — skipping model load.")
 
-    # --- Run all methods across all alphas ---
-    rows = []
-    for alpha in ALPHAS:
-        print(f"\nAlpha = {alpha} ...")
-        res = run_all(pipeline, cal_ctx, cal_fut, test_ctx, test_fut, cal_embs, test_embs, alpha)
+        # Embeddings only needed for Embed-CQR
+        need_embed = any(
+            not already_done(df_existing, "Embed-CQR", a) for a in ALPHAS
+        )
+        if need_embed and pipeline is not None:
+            print("\nComputing calibration embeddings ...")
+            cal_embs  = method_embed_cqr.get_embeddings(pipeline, cal_ctx)
+            print("Computing test embeddings ...")
+            test_embs = method_embed_cqr.get_embeddings(pipeline, test_ctx)
+        else:
+            cal_embs = test_embs = None
 
-        fut_np = test_fut.numpy()
-        for method, r in res.items():
-            lo, hi  = r["lo"], r["hi"]
-            covered = (fut_np >= lo) & (fut_np <= hi)
-            rows.append({
-                "method":   method,
-                "alpha":    alpha,
-                "nominal":  round(1 - alpha, 2),
-                "coverage": round(float(covered.mean()), 4),
-                "width":    round(float((hi - lo).mean()), 2),
-            })
+        for alpha in ALPHAS:
+            for method in ALL_METHODS:
+                if already_done(df_existing, method, alpha):
+                    print(f"  [skip] {method}  α={alpha}")
+                    continue
 
-    df = pd.DataFrame(rows)
-    df.to_csv("results_table.csv", index=False)
-    print("\n" + df.to_string(index=False))
+                print(f"  [run]  {method}  α={alpha} ...")
 
-    # --- Plots ---
+                if method == "Naive":
+                    lo, hi, fut_np = run_naive(pipeline, test_ctx, test_fut, alpha)
+
+                elif method == "CQR":
+                    lo, hi, fut_np = run_cqr(pipeline, cal_ctx, cal_fut,
+                                             test_ctx, test_fut, alpha)
+
+                elif method == "Embed-CQR":
+                    lo, hi, fut_np = run_embed_cqr(
+                        pipeline, cal_ctx, cal_fut, test_ctx, test_fut,
+                        cal_embs, test_embs, alpha
+                    )
+
+                elif method == "PID":
+                    # PID needs the full time series, not pre-windowed tensors
+                    result = method_pid.run_pid(
+                        pipeline, wide, train_wide, cal_wide,
+                        test_wide=test_wide, alpha=alpha
+                    )
+                    lo, hi = result["lo"], result["hi"]
+                    # reconstruct futures from test windows to match shape
+                    # PID strides by pred_len internally; use non-overlapping windows
+                    test_tensors_nonoverlap = to_tensor_list(test_wide)
+                    _, fut_pid = make_all_windows(
+                        test_tensors_nonoverlap, CONTEXT_LEN, PRED_LEN, stride=PRED_LEN
+                    )
+                    fut_np = fut_pid.numpy()
+                    # trim to match PID output length
+                    n = min(lo.shape[0], fut_np.shape[0])
+                    lo, hi, fut_np = lo[:n], hi[:n], fut_np[:n]
+
+                m = metrics_from_arrays(lo, hi, fut_np)
+                append_result(method, alpha, m["coverage"], m["width"])
+                print(f"         coverage={m['coverage']:.3f}  width={m['width']:.2f}")
+
+    # --- Plots (always regenerated) ---
+    df = pd.read_csv(RESULTS_CSV)
+    print("\n" + df.sort_values(["method", "alpha"]).to_string(index=False))
+
     plot_calibration_curve(df)
     plot_width_vs_alpha(df)
 
-    for state in EXAMPLE_STATES:
-        plot_intervals_for_state(pipeline, wide, test_wide, state, alpha=0.1)
+    if not plots_only:
+        for state in EXAMPLE_STATES:
+            plot_intervals_for_state(pipeline, wide, test_wide, state, alpha=0.10)
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--plots-only", action="store_true",
+                        help="Skip experiments; regenerate plots from saved CSV")
+    args = parser.parse_args()
+    main(plots_only=args.plots_only)
