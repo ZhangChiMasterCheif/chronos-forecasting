@@ -221,13 +221,35 @@ def plot_intervals_for_state(pipeline, wide, test_wide, state: str, alpha: float
     else:
         Q_hat_s = 0.0
 
-    naive_lo, naive_hi   = method_naive.predict_intervals(pipeline, ctx, PRED_LEN, alpha)
-    base_lo, base_hi     = method_cqr.get_quantiles(pipeline, ctx, PRED_LEN, alpha)
-    cqr_lo, cqr_hi       = method_cqr.apply_correction(base_lo, base_hi, Q_hat_s)
+    naive_lo, naive_hi = method_naive.predict_intervals(pipeline, ctx, PRED_LEN, alpha)
+    base_lo, base_hi   = method_cqr.get_quantiles(pipeline, ctx, PRED_LEN, alpha)
+    cqr_lo, cqr_hi     = method_cqr.apply_correction(base_lo, base_hi, Q_hat_s)
+
+    # Embed-CQR: per-state weighted correction using calibration embeddings
+    cal_embs_s  = method_embed_cqr.get_embeddings(pipeline, cal_ctx_s)
+    test_embs_s = method_embed_cqr.get_embeddings(pipeline, ctx)
+    gamma_s     = method_embed_cqr.median_heuristic_gamma(cal_embs_s)
+    ecqr_lo     = np.empty_like(base_lo)
+    ecqr_hi     = np.empty_like(base_hi)
+    for j in range(ctx.shape[0]):
+        w           = method_embed_cqr.rbf_weights(test_embs_s[j], cal_embs_s, gamma_s)
+        Q_hat_j     = method_embed_cqr.weighted_quantile(scores_s, w, alpha)
+        ecqr_lo[j], ecqr_hi[j] = method_cqr.apply_correction(
+            base_lo[j:j+1], base_hi[j:j+1], Q_hat_j
+        )
+
+    # PID: run online for this single state
+    full_series     = torch.tensor(wide[state].values.astype("float32"))
+    test_start_idx  = len(wide) - len(test_wide)
+    pid_lo, pid_hi, _ = method_pid.run_pid_one_state(
+        pipeline, full_series, test_start_idx, alpha, q0=Q_hat_s
+    )
 
     method_intervals = [
-        ("Naive",   naive_lo, naive_hi, "steelblue"),
-        ("CQR",     cqr_lo,   cqr_hi,   "darkorange"),
+        ("Naive",      naive_lo, naive_hi, "steelblue"),
+        ("CQR",        cqr_lo,   cqr_hi,   "darkorange"),
+        ("Embed-CQR",  ecqr_lo,  ecqr_hi,  "seagreen"),
+        ("PID",        pid_lo,   pid_hi,   "mediumpurple"),
     ]
 
     fig, axes = plt.subplots(len(method_intervals), 1,
@@ -271,35 +293,29 @@ def plot_intervals_for_state(pipeline, wide, test_wide, state: str, alpha: float
 def main(plots_only=False):
     df_existing = load_existing_results()
 
+    # Data and pipeline are always needed: experiments need them, and so do
+    # the per-state interval plots (which call the model directly).
+    print("Loading data ...")
+    wide = load_hosp_wide()
+    train_wide, cal_wide, test_wide = split_wide(wide)
+
+    cal_tensors  = to_tensor_list(cal_wide)
+    test_tensors = to_tensor_list(test_wide)
+    cal_ctx,  cal_fut  = make_all_windows(cal_tensors,  CONTEXT_LEN, PRED_LEN, stride=STRIDE)
+    test_ctx, test_fut = make_all_windows(test_tensors, CONTEXT_LEN, PRED_LEN, stride=STRIDE)
+
+    print(f"\nLoading Chronos model: {MODEL_ID} ...")
+    pipeline = BaseChronosPipeline.from_pretrained(
+        MODEL_ID, device_map="auto", torch_dtype=torch.float32,
+    )
+
     if not plots_only:
-        print("Loading data ...")
-        wide = load_hosp_wide()
-        train_wide, cal_wide, test_wide = split_wide(wide)
-
-        cal_tensors  = to_tensor_list(cal_wide)
-        test_tensors = to_tensor_list(test_wide)
-        cal_ctx,  cal_fut  = make_all_windows(cal_tensors,  CONTEXT_LEN, PRED_LEN, stride=STRIDE)
-        test_ctx, test_fut = make_all_windows(test_tensors, CONTEXT_LEN, PRED_LEN, stride=STRIDE)
-
-        need_model = any(
-            not already_done(df_existing, m, a)
-            for m in ALL_METHODS for a in ALPHAS
-        )
-
-        if need_model:
-            print(f"\nLoading Chronos model: {MODEL_ID} ...")
-            pipeline = BaseChronosPipeline.from_pretrained(
-                MODEL_ID, device_map="auto", torch_dtype=torch.float32,
-            )
-        else:
-            pipeline = None
-            print("All experiments already done — skipping model load.")
 
         # Embeddings only needed for Embed-CQR
         need_embed = any(
             not already_done(df_existing, "Embed-CQR", a) for a in ALPHAS
         )
-        if need_embed and pipeline is not None:
+        if need_embed:
             print("\nComputing calibration embeddings ...")
             cal_embs  = method_embed_cqr.get_embeddings(pipeline, cal_ctx)
             print("Computing test embeddings ...")
