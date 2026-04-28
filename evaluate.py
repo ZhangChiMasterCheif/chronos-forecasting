@@ -185,7 +185,18 @@ def plot_width_vs_alpha(df: pd.DataFrame):
     print("Saved width_vs_alpha.png")
 
 
-def plot_intervals_for_state(pipeline, wide, test_wide, state: str, alpha: float = 0.10):
+def plot_intervals_for_state(
+    pipeline, wide, test_wide, state: str,
+    cal_ctx_all, cal_fut_all, cal_embs_all,
+    alpha: float = 0.10,
+):
+    """
+    Parameters
+    ----------
+    cal_ctx_all  : (N_cal, context_len)  — full 50-state calibration contexts
+    cal_fut_all  : (N_cal, pred_len)     — full 50-state calibration futures
+    cal_embs_all : (N_cal, d_model)      — pre-computed 50-state embeddings
+    """
     if state not in test_wide.columns:
         print(f"  '{state}' not found, skipping.")
         return
@@ -195,54 +206,47 @@ def plot_intervals_for_state(pipeline, wide, test_wide, state: str, alpha: float
     if ctx.shape[0] == 0:
         return
 
-    dates_test  = test_wide.index
-    n_windows   = ctx.shape[0]
+    dates_test = test_wide.index
+    n_windows  = ctx.shape[0]
 
-    # start date of each window's future block
     window_starts = [
         dates_test[CONTEXT_LEN + i * PRED_LEN]
         for i in range(n_windows)
         if CONTEXT_LEN + i * PRED_LEN < len(dates_test)
     ]
     n_windows = len(window_starts)
-    ctx = ctx[:n_windows]
-    fut = fut[:n_windows]
+    ctx    = ctx[:n_windows]
+    fut    = fut[:n_windows]
     fut_np = fut.numpy()
 
-    # quick single-state calibration for CQR correction
-    cal_series = torch.tensor(
-        wide[state].loc[wide.index < test_wide.index[0]].values[-182:].astype("float32")
+    # shared calibration scores from the full 50-state cal set
+    cal_lo_all, cal_hi_all = method_cqr.get_quantiles(
+        pipeline, cal_ctx_all, PRED_LEN, alpha
     )
-    cal_ctx_s, cal_fut_s = make_all_windows([cal_series], CONTEXT_LEN, PRED_LEN, stride=PRED_LEN)
-    if cal_ctx_s.shape[0] > 0:
-        c_lo, c_hi   = method_cqr.get_quantiles(pipeline, cal_ctx_s, PRED_LEN, alpha)
-        scores_s     = method_cqr.cqr_scores(c_lo, c_hi, cal_fut_s.numpy())
-        Q_hat_s      = method_cqr.cqr_quantile(scores_s, alpha)
-    else:
-        Q_hat_s = 0.0
+    scores_all = method_cqr.cqr_scores(cal_lo_all, cal_hi_all, cal_fut_all.numpy())
+    Q_hat      = method_cqr.cqr_quantile(scores_all, alpha)
+    gamma      = method_embed_cqr.median_heuristic_gamma(cal_embs_all)
 
     naive_lo, naive_hi = method_naive.predict_intervals(pipeline, ctx, PRED_LEN, alpha)
     base_lo, base_hi   = method_cqr.get_quantiles(pipeline, ctx, PRED_LEN, alpha)
-    cqr_lo, cqr_hi     = method_cqr.apply_correction(base_lo, base_hi, Q_hat_s)
+    cqr_lo, cqr_hi     = method_cqr.apply_correction(base_lo, base_hi, Q_hat)
 
-    # Embed-CQR: per-state weighted correction using calibration embeddings
-    cal_embs_s  = method_embed_cqr.get_embeddings(pipeline, cal_ctx_s)
-    test_embs_s = method_embed_cqr.get_embeddings(pipeline, ctx)
-    gamma_s     = method_embed_cqr.median_heuristic_gamma(cal_embs_s)
-    ecqr_lo     = np.empty_like(base_lo)
-    ecqr_hi     = np.empty_like(base_hi)
+    # Embed-CQR: weight 50-state cal scores by similarity to each test window
+    test_embs = method_embed_cqr.get_embeddings(pipeline, ctx)
+    ecqr_lo   = np.empty_like(base_lo)
+    ecqr_hi   = np.empty_like(base_hi)
     for j in range(ctx.shape[0]):
-        w           = method_embed_cqr.rbf_weights(test_embs_s[j], cal_embs_s, gamma_s)
-        Q_hat_j     = method_embed_cqr.weighted_quantile(scores_s, w, alpha)
+        w          = method_embed_cqr.rbf_weights(test_embs[j], cal_embs_all, gamma)
+        Q_hat_j    = method_embed_cqr.weighted_quantile(scores_all, w, alpha)
         ecqr_lo[j], ecqr_hi[j] = method_cqr.apply_correction(
             base_lo[j:j+1], base_hi[j:j+1], Q_hat_j
         )
 
-    # PID: run online for this single state
-    full_series     = torch.tensor(wide[state].values.astype("float32"))
-    test_start_idx  = len(wide) - len(test_wide)
+    # PID: run online for this single state, warm-started with the 50-state Q_hat
+    full_series    = torch.tensor(wide[state].values.astype("float32"))
+    test_start_idx = len(wide) - len(test_wide)
     pid_lo, pid_hi, _ = method_pid.run_pid_one_state(
-        pipeline, full_series, test_start_idx, alpha, q0=Q_hat_s
+        pipeline, full_series, test_start_idx, alpha, q0=Q_hat
     )
 
     method_intervals = [
@@ -373,8 +377,16 @@ def main(plots_only=False):
     plot_calibration_curve(df)
     plot_width_vs_alpha(df)
 
+    # Embeddings needed for per-state Embed-CQR plots — compute if not already done
+    if "cal_embs" not in dir():
+        print("\nComputing calibration embeddings for plots ...")
+        cal_embs  = method_embed_cqr.get_embeddings(pipeline, cal_ctx)
     for state in EXAMPLE_STATES:
-        plot_intervals_for_state(pipeline, wide, test_wide, state, alpha=0.10)
+        plot_intervals_for_state(
+            pipeline, wide, test_wide, state,
+            cal_ctx_all=cal_ctx, cal_fut_all=cal_fut, cal_embs_all=cal_embs,
+            alpha=0.10,
+        )
 
 
 if __name__ == "__main__":
