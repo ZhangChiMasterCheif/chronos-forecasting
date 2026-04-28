@@ -29,14 +29,7 @@ import numpy as np
 import torch
 from chronos import BaseChronosPipeline
 
-from covid_dataset import (
-    load_hosp_wide,
-    split_wide,
-    to_tensor_list,
-    make_all_windows,
-    CONTEXT_LEN,
-    PRED_LEN,
-)
+from covid_dataset import load_hosp_wide, split_wide, to_tensor_list, make_all_windows
 
 # ---------------------------------------------------------------------------
 # Config
