@@ -176,7 +176,7 @@ class MeanScaleUniformBins(ChronosTokenizer):
         if scale is None:
             scale = torch.nansum(torch.abs(context) * attention_mask, dim=-1) / torch.nansum(attention_mask, dim=-1)
             scale[~(scale > 0)] = 1.0
-        print("chronos.py 179 _input_transform scale")
+        #print("chronos.py 179 _input_transform scale")
         
         scaled_context = context / scale.unsqueeze(dim=-1)
         token_ids = (
@@ -189,7 +189,7 @@ class MeanScaleUniformBins(ChronosTokenizer):
             )
             + self.config.n_special_tokens
         )
-        breakpoint()
+        #breakpoint()
         token_ids.clamp_(0, self.config.n_tokens - 1)
 
         token_ids[~attention_mask] = self.config.pad_token_id
@@ -238,7 +238,7 @@ class MeanScaleUniformBins(ChronosTokenizer):
             min=0,
             max=len(self.centers) - 1,
         )
-        breakpoint()
+        #breakpoint()
         return self.centers[indices] * scale_unsqueezed
 
 

@@ -17,7 +17,7 @@ import pandas as pd
 import torch
 from typing import List, Tuple
 
-HOSP_CSV = "/home/czhan168/data_ghobadk1/chi/Covid/covid_data/timeseries/hosp_daily_state.csv"
+HOSP_CSV = "../Covid/covid_data/timeseries/hosp_daily_state.csv"
 HOSP_COL = "Confirmed COVID-19 Hospital Admissions"
 
 TRAIN_END  = "2021-12-31"
