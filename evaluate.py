@@ -32,6 +32,7 @@ from covid_dataset import load_hosp_wide, split_wide, to_tensor_list, make_all_w
 import method_naive
 import method_cqr
 import method_embed_cqr
+import method_codebook_cqr
 import method_pid
 
 # ---------------------------------------------------------------------------
@@ -49,7 +50,7 @@ ALPHAS      = [0.05, 0.10, 0.20, 0.30, 0.40]
 EXAMPLE_STATES = ["New York", "California", "Texas", "Florida"]
 RESULTS_CSV    = "results_table.csv"
 
-ALL_METHODS = ["Naive", "CQR", "Embed-CQR", "PID"]
+ALL_METHODS = ["Naive", "CQR", "Codebook-CQR", "Embed-CQR", "PID"]
 
 
 # ---------------------------------------------------------------------------
@@ -107,6 +108,28 @@ def run_cqr(pipeline, cal_ctx, cal_fut, test_ctx, test_fut, alpha):
     Q_hat            = method_cqr.cqr_quantile(scores, alpha)
     test_lo, test_hi = method_cqr.get_quantiles(pipeline, test_ctx, PRED_LEN, alpha)
     lo, hi           = method_cqr.apply_correction(test_lo, test_hi, Q_hat)
+    return lo, hi, test_fut.numpy()
+
+
+def run_codebook_cqr(pipeline, cal_ctx, cal_fut, test_ctx, test_fut, alpha):
+    n_tokens = pipeline.tokenizer.config.n_tokens
+
+    # Calibration in bin space
+    cal_bin_lo, cal_bin_hi, cal_scale = method_codebook_cqr.get_sample_bins(
+        pipeline, cal_ctx, PRED_LEN, alpha
+    )
+    cal_true_bins = method_codebook_cqr.get_true_bins(pipeline, cal_fut, cal_scale)
+    scores        = method_codebook_cqr.codebook_scores(cal_bin_lo, cal_bin_hi, cal_true_bins)
+    Q_hat         = method_cqr.cqr_quantile(scores, alpha)   # works the same in bin units
+
+    # Test in bin space, then back to values
+    test_bin_lo, test_bin_hi, test_scale = method_codebook_cqr.get_sample_bins(
+        pipeline, test_ctx, PRED_LEN, alpha
+    )
+    lo_bins, hi_bins = method_codebook_cqr.apply_correction(
+        test_bin_lo, test_bin_hi, Q_hat, n_tokens
+    )
+    lo, hi = method_codebook_cqr.bins_to_values(pipeline, lo_bins, hi_bins, test_scale)
     return lo, hi, test_fut.numpy()
 
 
@@ -231,6 +254,27 @@ def plot_intervals_for_state(
     base_lo, base_hi   = method_cqr.get_quantiles(pipeline, ctx, PRED_LEN, alpha)
     cqr_lo, cqr_hi     = method_cqr.apply_correction(base_lo, base_hi, Q_hat)
 
+    # Codebook-CQR: same conformal procedure but in bin-index space
+    n_tokens = pipeline.tokenizer.config.n_tokens
+    cal_bin_lo_all, cal_bin_hi_all, cal_scale_cb = method_codebook_cqr.get_sample_bins(
+        pipeline, cal_ctx_all, PRED_LEN, alpha
+    )
+    cal_true_bins_all = method_codebook_cqr.get_true_bins(pipeline, cal_fut_all, cal_scale_cb)
+    cb_scores         = method_codebook_cqr.codebook_scores(
+        cal_bin_lo_all, cal_bin_hi_all, cal_true_bins_all
+    )
+    Q_hat_cb = method_cqr.cqr_quantile(cb_scores, alpha)
+
+    test_bin_lo, test_bin_hi, test_scale_cb = method_codebook_cqr.get_sample_bins(
+        pipeline, ctx, PRED_LEN, alpha
+    )
+    cb_lo_bins, cb_hi_bins = method_codebook_cqr.apply_correction(
+        test_bin_lo, test_bin_hi, Q_hat_cb, n_tokens
+    )
+    cbcqr_lo, cbcqr_hi = method_codebook_cqr.bins_to_values(
+        pipeline, cb_lo_bins, cb_hi_bins, test_scale_cb
+    )
+
     # Embed-CQR: weight 50-state cal scores by similarity to each test window
     test_embs = method_embed_cqr.get_embeddings(pipeline, ctx)
     ecqr_lo   = np.empty_like(base_lo)
@@ -261,10 +305,11 @@ def plot_intervals_for_state(
     )
 
     method_intervals = [
-        ("Naive",      naive_lo, naive_hi, "steelblue"),
-        ("CQR",        cqr_lo,   cqr_hi,   "darkorange"),
-        ("Embed-CQR",  ecqr_lo,  ecqr_hi,  "seagreen"),
-        ("PID",        pid_lo,   pid_hi,   "mediumpurple"),
+        ("Naive",         naive_lo,  naive_hi,  "steelblue"),
+        ("CQR",           cqr_lo,    cqr_hi,    "darkorange"),
+        ("Codebook-CQR",  cbcqr_lo,  cbcqr_hi,  "crimson"),
+        ("Embed-CQR",     ecqr_lo,   ecqr_hi,   "seagreen"),
+        ("PID",           pid_lo,    pid_hi,    "mediumpurple"),
     ]
 
     fig, axes = plt.subplots(len(method_intervals), 1,
@@ -352,6 +397,11 @@ def main(plots_only=False):
                 elif method == "CQR":
                     lo, hi, fut_np = run_cqr(pipeline, cal_ctx, cal_fut,
                                              test_ctx, test_fut, alpha)
+
+                elif method == "Codebook-CQR":
+                    lo, hi, fut_np = run_codebook_cqr(
+                        pipeline, cal_ctx, cal_fut, test_ctx, test_fut, alpha
+                    )
 
                 elif method == "Embed-CQR":
                     lo, hi, fut_np = run_embed_cqr(
