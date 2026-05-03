@@ -439,7 +439,7 @@ def main(plots_only=False):
     plot_width_vs_alpha(df)
 
     # Embeddings needed for per-state Embed-CQR plots — compute if not already done
-    if "cal_embs" not in dir():
+    if "cal_embs" not in dir() or cal_embs is None:
         print("\nComputing calibration embeddings for plots ...")
         cal_embs  = method_embed_cqr.get_embeddings(pipeline, cal_ctx)
     for state in EXAMPLE_STATES:
